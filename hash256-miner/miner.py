@@ -3,10 +3,11 @@
 HASH256 GPU Miner CLI
 GPU-accelerated miner for HASH token (0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc)
 
-Mining flow:
-  1. challenge = keccak256(chainId || contractAddress || minerAddress || epoch)
-  2. Find nonce where keccak256(challenge || nonce) < currentDifficulty
-  3. Submit via mint(bytes32 challenge, uint256 nonce)
+Correct contract flow (from verified ABI):
+  1. challenge = getChallenge(minerAddress)  [on-chain]
+  2. difficulty = currentDifficulty()
+  3. Find nonce where keccak256(challenge || nonce) < difficulty
+  4. Submit via mine(uint256 nonce)
 """
 
 import os
@@ -39,12 +40,18 @@ if env_file.exists():
 HASH_CONTRACT = "0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc"
 CHAIN_ID = 1  # Ethereum Mainnet
 
+# Verified ABI from anyabi.xyz / Etherscan
 CONTRACT_ABI = json.loads("""[
+    {"inputs":[{"internalType":"address","name":"miner","type":"address"}],"name":"getChallenge","outputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"stateMutability":"view","type":"function"},
     {"inputs":[],"name":"currentDifficulty","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
-    {"inputs":[],"name":"currentEpoch","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
-    {"inputs":[{"internalType":"bytes32","name":"challenge","type":"bytes32"},{"internalType":"uint256","name":"nonce","type":"uint256"}],"name":"mint","outputs":[],"stateMutability":"nonpayable","type":"function"},
-    {"inputs":[],"name":"hashTotalSupply","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
-    {"inputs":[],"name":"totalMints","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"}
+    {"inputs":[{"internalType":"uint256","name":"nonce","type":"uint256"}],"name":"mine","outputs":[],"stateMutability":"nonpayable","type":"function"},
+    {"inputs":[],"name":"miningState","outputs":[{"internalType":"uint256","name":"era","type":"uint256"},{"internalType":"uint256","name":"reward","type":"uint256"},{"internalType":"uint256","name":"difficulty","type":"uint256"},{"internalType":"uint256","name":"minted","type":"uint256"},{"internalType":"uint256","name":"remaining","type":"uint256"},{"internalType":"uint256","name":"epoch","type":"uint256"},{"internalType":"uint256","name":"epochBlocksLeft_","type":"uint256"}],"stateMutability":"view","type":"function"},
+    {"inputs":[],"name":"currentReward","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+    {"inputs":[],"name":"totalMints","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+    {"inputs":[],"name":"totalMiningMinted","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+    {"inputs":[],"name":"totalSupply","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+    {"inputs":[],"name":"epochBlocksLeft","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+    {"inputs":[],"name":"genesisComplete","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"}
 ]""")
 
 
@@ -85,7 +92,7 @@ class GPUMiner:
         """
         Find nonce where keccak256(challenge || nonce) < target.
         challenge_hex: 64-char hex (32 bytes)
-        target_hex: 64-char hex (32 bytes) - this IS the difficulty value
+        target_hex: 64-char hex (32 bytes) - the difficulty (hash must be < this)
         """
         challenge_hex = challenge_hex.replace("0x", "").lower()
         target_hex = target_hex.replace("0x", "").lower()
@@ -116,7 +123,7 @@ class CPUMiner:
 
         for i in range(batch_size):
             nonce = start_nonce + i
-            # nonce as uint256 big-endian (32 bytes) - matches Solidity abi.encodePacked(bytes32, uint256)
+            # nonce as uint256 big-endian (32 bytes)
             nonce_bytes = nonce.to_bytes(32, byteorder='big')
             input_data = challenge_bytes + nonce_bytes
             hash_result = Web3.keccak(input_data)
@@ -151,38 +158,40 @@ class HashContract:
         print(f"  [RPC] Connected | Chain: {self.w3.eth.chain_id} | Block: {self.w3.eth.block_number}")
         print(f"  [WALLET] {self.wallet}")
 
-    def get_epoch(self):
-        """Get current epoch from contract."""
-        return self.contract.functions.currentEpoch().call()
+    def get_challenge(self):
+        """Get current challenge from contract for this miner's address."""
+        challenge = self.contract.functions.getChallenge(self.wallet).call()
+        return challenge.hex()
 
     def get_difficulty(self):
-        """Get current difficulty (target). Hash must be < this value."""
+        """Get current difficulty. Hash must be < this value to be valid."""
         return self.contract.functions.currentDifficulty().call()
 
-    def compute_challenge(self, epoch):
-        """
-        Compute challenge off-chain:
-        challenge = keccak256(abi.encodePacked(chainId, contractAddress, minerAddress, epoch))
-        """
-        # solidityPackedKeccak256(['uint256', 'address', 'address', 'uint256'], [...])
-        encoded = self.w3.solidity_keccak(
-            ['uint256', 'address', 'address', 'uint256'],
-            [CHAIN_ID, Web3.to_checksum_address(HASH_CONTRACT), self.wallet, epoch]
-        )
-        return encoded.hex()
-
     def difficulty_to_target_hex(self, difficulty):
-        """
-        Convert difficulty uint256 to 32-byte hex for comparison.
-        In this contract, hash < difficulty means valid.
-        """
+        """Convert difficulty uint256 to 32-byte hex string for GPU comparison."""
         return difficulty.to_bytes(32, byteorder='big').hex()
 
-    def submit_solution(self, challenge_hex, nonce_int, gas_price_gwei=None, gas_limit=300000):
-        """Submit mint(bytes32 challenge, uint256 nonce) transaction."""
-        challenge_bytes = bytes.fromhex(challenge_hex.replace("0x", ""))
+    def get_mining_state(self):
+        """Get full mining state from contract."""
+        try:
+            r = self.contract.functions.miningState().call()
+            return {
+                "era": r[0],
+                "reward": r[1],
+                "difficulty": r[2],
+                "minted": r[3],
+                "remaining": r[4],
+                "epoch": r[5],
+                "epochBlocksLeft": r[6],
+            }
+        except Exception:
+            # Fallback to individual calls
+            diff = self.contract.functions.currentDifficulty().call()
+            return {"era": 0, "reward": 0, "difficulty": diff, "minted": 0, "remaining": 0, "epoch": 0, "epochBlocksLeft": 0}
 
-        tx = self.contract.functions.mint(challenge_bytes, nonce_int).build_transaction({
+    def submit_solution(self, nonce_int, gas_price_gwei=None, gas_limit=300000):
+        """Submit mine(uint256 nonce) transaction."""
+        tx = self.contract.functions.mine(nonce_int).build_transaction({
             'from': self.wallet,
             'nonce': self.w3.eth.get_transaction_count(self.wallet),
             'gas': gas_limit,
@@ -203,29 +212,37 @@ class HashContract:
             print(f"  [TX] FAILED!")
             return False
 
-    def get_contract_info(self):
+    def display_info(self):
         """Display contract stats."""
         try:
-            total_supply = self.contract.functions.hashTotalSupply().call()
-            total_mints = self.contract.functions.totalMints().call()
-            difficulty = self.contract.functions.currentDifficulty().call()
-            epoch = self.contract.functions.currentEpoch().call()
+            state = self.get_mining_state()
+            genesis = self.contract.functions.genesisComplete().call()
+            reward_wei = state["reward"]
+            reward_hash = float(Web3.from_wei(reward_wei, 'ether')) if reward_wei > 0 else 0
 
-            era = int(total_mints) // 100000
-            reward = 100 / (2 ** era)
+            print(f"\n  {'='*55}")
+            print(f"  HASH Token - Mining Info")
+            print(f"  {'='*55}")
+            print(f"  Contract:      {HASH_CONTRACT}")
+            print(f"  Genesis:       {'Complete' if genesis else 'NOT COMPLETE (mining not active!)'}")
+            print(f"  Era:           {state['era']}")
+            print(f"  Reward:        {reward_hash:.4f} HASH/mint")
+            print(f"  Difficulty:    {state['difficulty']}")
+            print(f"  Total Minted:  {state['minted']}")
+            print(f"  Remaining:     {state['remaining']}")
+            print(f"  Epoch:         {state['epoch']}")
+            print(f"  Epoch Blocks Left: {state['epochBlocksLeft']}")
+            print(f"  {'='*55}\n")
 
-            print(f"\n  {'='*50}")
-            print(f"  HASH Contract Info")
-            print(f"  {'='*50}")
-            print(f"  Contract:    {HASH_CONTRACT}")
-            print(f"  Total Supply: {Web3.from_wei(total_supply, 'ether'):.2f} HASH")
-            print(f"  Total Mints: {total_mints}")
-            print(f"  Epoch:       {epoch}")
-            print(f"  Difficulty:  {difficulty}")
-            print(f"  Reward:      {reward:.2f} HASH/mint (Era {era})")
-            print(f"  {'='*50}\n")
+            if not genesis:
+                print("  [!] WARNING: Genesis phase not complete!")
+                print("  [!] Mining is NOT active yet. Wait for genesis to finish.")
+                print("  [!] Check: https://hash256.org\n")
+                return False
+            return True
         except Exception as e:
             print(f"  [WARN] Could not fetch contract info: {e}")
+            return True  # Continue anyway
 
 
 # ============================================================================
@@ -247,7 +264,7 @@ def main():
     parser.add_argument("--gas-price", type=float, default=None,
                         help="Gas price in gwei (default: auto)")
     parser.add_argument("--gas-limit", type=int, default=300000,
-                        help="Gas limit for mint() tx")
+                        help="Gas limit for mine() tx")
     parser.add_argument("--cuda-lib", default=None,
                         help="Path to CUDA library")
     parser.add_argument("--cpu", action="store_true",
@@ -264,7 +281,7 @@ def main():
 
     print("""
     ╔══════════════════════════════════════════════════╗
-    ║        HASH256 GPU MINER v2.0.0                 ║
+    ║        HASH256 GPU MINER v2.1.0                 ║
     ║        Contract: 0xAC7b...A0cc                  ║
     ║        https://hash256.org                      ║
     ╚══════════════════════════════════════════════════╝
@@ -285,7 +302,11 @@ def main():
     # Connect to contract
     print("  [INIT] Connecting to Ethereum...")
     contract = HashContract(args.rpc, pk)
-    contract.get_contract_info()
+    mining_active = contract.display_info()
+
+    if not mining_active:
+        print("  [!] Exiting - mining not active yet.")
+        sys.exit(0)
 
     # Mining state
     running = True
@@ -301,26 +322,25 @@ def main():
     signal.signal(signal.SIGTERM, stop)
 
     print(f"  [CONFIG] Batch size: {args.batch_size:,}")
-    print(f"  [CONFIG] GPU mode: {'CPU' if args.cpu else 'CUDA'}")
+    print(f"  [CONFIG] Mode: {'CPU' if args.cpu else 'CUDA GPU'}")
     print(f"  [START] Mining started!\n")
 
     while running:
         try:
-            # 1. Get epoch and difficulty from contract
-            epoch = contract.get_epoch()
-            difficulty = contract.get_difficulty()
+            # 1. Get challenge from contract (per-miner, per-epoch)
+            challenge_hex = contract.get_challenge()
 
-            # 2. Compute challenge off-chain
-            challenge_hex = contract.compute_challenge(epoch)
+            # 2. Get difficulty
+            difficulty = contract.get_difficulty()
             target_hex = contract.difficulty_to_target_hex(difficulty)
 
-            print(f"  [EPOCH {epoch}] Difficulty: {difficulty}")
-            print(f"  [EPOCH {epoch}] Challenge: 0x{challenge_hex[:16]}...")
+            print(f"\n  [MINING] Challenge: 0x{challenge_hex[:16]}...")
+            print(f"  [MINING] Difficulty: {difficulty}")
 
             # 3. Mine in batches
             batch_num = 0
             found = False
-            # Randomize start nonce to avoid collision with other miners
+            # Random start nonce to avoid collision with other miners
             nonce_offset = random.randint(0, 2**48)
 
             while running and not found:
@@ -338,7 +358,7 @@ def main():
                 avg_hr = total_hashes / (time.time() - t0)
 
                 sys.stdout.write(
-                    f"\r  [MINING] Batch #{batch_num} | "
+                    f"\r  [HASH] Batch #{batch_num} | "
                     f"{hr/1e6:.1f} MH/s (avg {avg_hr/1e6:.1f}) | "
                     f"Total: {total_hashes:,} | Solutions: {solutions}"
                 )
@@ -349,33 +369,33 @@ def main():
                     solutions += 1
                     nonce_int = int(nonce_hex, 16)
 
-                    print(f"\n\n  {'='*50}")
+                    print(f"\n\n  {'='*55}")
                     print(f"  SOLUTION FOUND!")
                     print(f"  Nonce: {nonce_int}")
                     print(f"  Hash:  0x{hash_hex}")
-                    print(f"  {'='*50}\n")
+                    print(f"  {'='*55}\n")
 
-                    # 4. Submit: mint(challenge, nonce)
+                    # 4. Submit: mine(nonce)
                     try:
                         success = contract.submit_solution(
-                            challenge_hex, nonce_int,
+                            nonce_int,
                             gas_price_gwei=args.gas_price,
                             gas_limit=args.gas_limit
                         )
                         if success:
                             print("  [OK] Minted HASH tokens!\n")
                         else:
-                            print("  [!] Mint failed (epoch may have changed)\n")
+                            print("  [!] TX failed (someone mined first?)\n")
                     except Exception as e:
                         print(f"  [ERROR] Submit failed: {e}\n")
 
                 batch_num += 1
 
-                # Check epoch change every 30 batches
-                if batch_num % 30 == 0 and not found:
-                    new_epoch = contract.get_epoch()
-                    if new_epoch != epoch:
-                        print(f"\n  [!] Epoch changed {epoch} -> {new_epoch}, restarting...")
+                # Check if challenge changed every 20 batches
+                if batch_num % 20 == 0 and not found:
+                    new_challenge = contract.get_challenge()
+                    if new_challenge != challenge_hex:
+                        print(f"\n  [!] Challenge changed (new epoch), restarting...")
                         break
 
             if running and not found:
@@ -389,10 +409,10 @@ def main():
 
     # Final stats
     total_time = time.time() - t0
-    print(f"\n\n  {'='*50}")
+    print(f"\n\n  {'='*55}")
     print(f"  Session: {total_time:.0f}s | Hashes: {total_hashes:,}")
     print(f"  Avg: {total_hashes/total_time/1e6:.1f} MH/s | Solutions: {solutions}")
-    print(f"  {'='*50}\n")
+    print(f"  {'='*55}\n")
 
 
 if __name__ == "__main__":
