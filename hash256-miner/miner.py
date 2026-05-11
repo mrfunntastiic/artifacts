@@ -29,7 +29,7 @@ if env_file.exists():
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip())
 
-DEFAULT_CONTRACT = os.getenv("HASH256_CONTRACT", "0x0000000000000000000000000000000000000000")
+DEFAULT_CONTRACT = os.getenv("HASH256_CONTRACT", "0xac7b5d06fa1e77d08aea40d46cb7c5923a87a0cc")
 
 CONTRACT_ABI = json.loads("""[
     {"inputs":[{"internalType":"address","name":"miner","type":"address"}],"name":"getChallenge","outputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"stateMutability":"view","type":"function"},
